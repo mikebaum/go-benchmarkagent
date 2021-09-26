@@ -1,7 +1,176 @@
-package go_benchmarkagent
+package main
 
-import "fmt"
+import (
+    "fmt"
+    "log"
+    "net/http"
+    "strconv"
+    "time"
+
+    vault "github.com/hashicorp/vault/api"
+    "github.com/prometheus/client_golang/prometheus"
+    pph "github.com/prometheus/client_golang/prometheus/promhttp"
+)
 
 func main() {
-    fmt.Print("hello world")
+
+    go startListener()
+
+    client := createClient()
+
+    for i := 0; i<10; i++ {
+        ci, err := client.Clone()
+        if err != nil {
+            log.Fatal(err)
+        }
+        go renewToken(ci)
+    }
+    time.Sleep(1000*time.Second)
+}
+
+func createClient() *vault.Client {
+    config := vault.DefaultConfig()
+    config.HttpClient = wrappedClient(config.HttpClient)
+    client, err := vault.NewClient(config)
+    if err != nil {
+        log.Fatal(err)
+    }
+    client.SetToken("devroot")
+
+    client.Sys().DisableAuth("userpass")
+    if err := client.Sys().EnableAuthWithOptions("userpass", &vault.EnableAuthOptions{
+        Type: "userpass",
+        Config: vault.MountConfigInput{
+            DefaultLeaseTTL: "3s",
+            MaxLeaseTTL:     "5s",
+        },
+    }); err != nil {
+        log.Fatal(err)
+    }
+
+    _, err = client.Logical().Write("auth/userpass/users/my-user", map[string]interface{}{"password": "my-password"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    return client
+}
+
+func startListener() {
+    http.Handle("/metrics", pph.Handler())
+    http.ListenAndServe(":2112", nil)
+}
+
+func wrappedClient(c *http.Client) *http.Client {
+    vec := prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "request_duration_histogram_seconds",
+            Help:    "A histogram of outgoing request latencies.",
+            Buckets: prometheus.DefBuckets,
+        },
+        []string{"request_path", "request_code"},
+    )
+    prometheus.MustRegister(vec)
+
+    return &http.Client{
+        CheckRedirect: c.CheckRedirect,
+        Jar:           c.Jar,
+        Timeout:       c.Timeout,
+        Transport: instrumentRoundTripperPath(vec, c.Transport),
+    }
+}
+
+func instrumentRoundTripperPath(obs prometheus.ObserverVec, next http.RoundTripper) pph.RoundTripperFunc {
+    return func(r *http.Request) (*http.Response, error) {
+        start := time.Now()
+        resp, err := next.RoundTrip(r)
+        if err == nil {
+            obs.With(prometheus.Labels{
+                "request_path": r.URL.Path,
+                "request_code": strconv.Itoa(resp.StatusCode),
+            }).Observe(time.Since(start).Seconds())
+        }
+        return resp, err
+    }
+}
+
+// Once you've set the token for your Vault client, you will need to periodically renew its lease.
+//
+// A function like this should be run as a goroutine to avoid blocking.
+//
+// Production applications may also wish to be more tolerant of failures and retry rather than exiting.
+//
+// Additionally, enterprise Vault users should be aware that due to eventual consistency, the API may return unexpected errors when
+// running Vault with performance standbys or performance replication, despite the client having a freshly renewed token.
+// See https://www.vaultproject.io/docs/enterprise/consistency#vault-1-7-mitigations for several ways to mitigate this
+// which are outside the scope of this code sample.
+func renewToken(client *vault.Client) {
+    for {
+        vaultLoginResp, err := login(client)
+        if err != nil {
+            log.Fatalf("unable to authenticate to Vault: %v", err)
+        }
+        tokenErr := manageTokenLifecycle(client, vaultLoginResp)
+        if tokenErr != nil {
+            log.Fatalf("unable to start managing token lifecycle: %v", tokenErr)
+        }
+    }
+}
+
+// Starts token lifecycle management. Returns only fatal errors as errors, otherwise returns nil so we can attempt login again.
+func manageTokenLifecycle(client *vault.Client, token *vault.Secret) error {
+    renew := token.Auth.Renewable // You may notice a different top-level field called Renewable. That one is used for dynamic secrets renewal, not token renewal.
+    if !renew {
+        log.Printf("Token is not configured to be renewable. Re-attempting login.")
+        return nil
+    }
+
+    watcher, err := client.NewLifetimeWatcher(&vault.LifetimeWatcherInput{
+        Secret:    token,
+        Increment: 3600, // Learn more about this optional value in https://www.vaultproject.io/docs/concepts/lease#lease-durations-and-renewal
+    })
+    if err != nil {
+        return fmt.Errorf("unable to initialize new lifetime watcher for renewing auth token: %w", err)
+    }
+
+    go watcher.Start()
+    defer watcher.Stop()
+
+    for {
+        select {
+        // `DoneCh` will return if renewal fails, or if the remaining lease duration is
+        // under a built-in threshold and either renewing is not extending it or
+        // renewing is disabled.  In any case, the caller needs to attempt to log in again.
+        case err := <-watcher.DoneCh():
+            if err != nil {
+                log.Printf("Failed to renew token: %v. Re-attempting login.", err)
+                return nil
+            }
+            log.Printf("Token can no longer be renewed. Re-attempting login.")
+            return nil
+
+        // Successfully completed renewal
+        case renewal := <-watcher.RenewCh():
+            log.Printf("Successfully renewed: %#v", renewal)
+        }
+    }
+}
+
+func login(client *vault.Client) (*vault.Secret, error) {
+    // WARNING: A plaintext password like this is obviously insecure.
+    // See the files starting in auth-* for full examples of how to securely log in to Vault using various auth methods.
+    // This is just demonstrating the basic idea that a *vault.Secret is returned by a call to an auth method's /login API endpoint.
+    resp, err := client.Logical().Write("auth/userpass/login/my-user", map[string]interface{}{"password": "my-password"})
+    if err != nil {
+        return nil, err
+    }
+    if resp == nil || resp.Auth == nil || resp.Auth.ClientToken == "" {
+        return nil, fmt.Errorf("login response did not return client token")
+    }
+
+    // have the client use that token for all Vault calls from now on
+    client.SetToken(resp.Auth.ClientToken)
+
+    log.Printf("resp: %#v", resp.Auth)
+
+    return resp, nil
 }
